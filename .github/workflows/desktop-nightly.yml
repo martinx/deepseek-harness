@@ -1,0 +1,151 @@
+name: Desktop Nightly
+
+# Fork-only Desktop build: sync master with upstream, then package an unsigned
+# macOS arm64 disk image and publish it to the rolling `desktop-nightly` release.
+# Unsigned local packaging needs no machine preset, signing identity, or notarization
+# credentials, so it runs entirely on GitHub-hosted runners.
+on:
+  schedule:
+    # Hourly check. A run only packages when upstream master moved, so most runs stop
+    # after the sync job. Scheduled workflows are best-effort and may start late.
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '上游没有新提交时也强制重新构建'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-nightly
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync from upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.sync.outputs.sha }}
+      short: ${{ steps.sync.outputs.short }}
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Rebase onto upstream master
+        id: sync
+        run: |
+          set -euo pipefail
+          git config user.name 'dsh-nightly'
+          git config user.email 'dsh-nightly@users.noreply.github.com'
+          git remote add upstream https://github.com/deepseek-ai/deepseek-harness.git 2>/dev/null || true
+          git fetch --no-tags upstream master
+          sha=$(git rev-parse upstream/master)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:10}" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$sha" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git rebase upstream/master
+            git push --force-with-lease origin HEAD:master
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Read product version
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Decide whether this run packages
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANGED: ${{ steps.sync.outputs.changed }}
+          FORCE: ${{ inputs.force_build }}
+          SHORT: ${{ steps.sync.outputs.short }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGED" = 'true' ] || [ "$FORCE" = 'true' ]; then
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! gh release view desktop-nightly >/dev/null 2>&1; then
+            echo "no desktop-nightly release yet"
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "upstream $SHORT already built; skipping"
+          echo 'build=false' >> "$GITHUB_OUTPUT"
+
+  macos:
+    name: Build macOS arm64 (unsigned)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: macos-14
+    timeout-minutes: 300
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+      DSH_DESKTOP_UPDATE_CHANNEL: nightly
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Package unsigned macOS arm64 disk image
+        run: pnpm run package:desktop:mac:arm64:unsigned
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-mac-arm64-unsigned
+          path: apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish desktop-nightly
+    needs: [sync, macos]
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Update the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.sync.outputs.version }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Unsigned macOS arm64 (Apple Silicon) Desktop build of upstream \`$SHA\`."
+            echo
+            echo "- Product version: \`$VERSION\`"
+            echo "- Built: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            echo 'Unsigned and not notarized, so macOS quarantines the download. After copying the app to `/Applications`, clear the flag once:'
+            echo
+            echo '```sh'
+            echo 'xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"'
+            echo '```'
+          } > notes.md
+          if gh release view desktop-nightly >/dev/null 2>&1; then
+            gh release edit desktop-nightly --prerelease --title 'Desktop nightly (unsigned)' --notes-file notes.md
+          else
+            gh release create desktop-nightly --prerelease --title 'Desktop nightly (unsigned)' --notes-file notes.md
+          fi
+          gh release upload desktop-nightly dist/*/* --clobber
